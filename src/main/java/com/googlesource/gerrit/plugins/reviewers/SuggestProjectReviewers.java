@@ -59,7 +59,7 @@ public class SuggestProjectReviewers extends SuggestReviewers
       @Override
       public boolean isVisibleTo(Account.Id account) throws OrmException {
         IdentifiedUser who =
-            identifiedUserFactory.create(dbProvider, account);
+            identifiedUserFactory.create(account);
         return rsrc.getControl().forUser(who).isVisible();
       }
     };

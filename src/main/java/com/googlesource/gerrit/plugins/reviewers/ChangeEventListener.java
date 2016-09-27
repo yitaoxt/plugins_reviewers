@@ -25,7 +25,6 @@ import com.google.gerrit.common.errors.NoSuchGroupException;
 import com.google.gerrit.extensions.restapi.UnprocessableEntityException;
 import com.google.gerrit.reviewdb.client.Account;
 import com.google.gerrit.reviewdb.client.Change;
-import com.google.gerrit.reviewdb.client.PatchSet;
 import com.google.gerrit.reviewdb.client.Project;
 import com.google.gerrit.reviewdb.server.ReviewDb;
 import com.google.gerrit.server.CurrentUser;
@@ -33,6 +32,7 @@ import com.google.gerrit.server.IdentifiedUser;
 import com.google.gerrit.server.account.AccountByEmailCache;
 import com.google.gerrit.server.account.AccountResolver;
 import com.google.gerrit.server.account.GroupMembers;
+import com.google.gerrit.server.data.ChangeAttribute;
 import com.google.gerrit.server.events.Event;
 import com.google.gerrit.server.events.PatchSetCreatedEvent;
 import com.google.gerrit.server.git.GitRepositoryManager;
@@ -50,6 +50,7 @@ import com.google.gwtorm.server.SchemaFactory;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import com.google.inject.ProvisionException;
+import com.google.inject.Singleton;
 
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -60,6 +61,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 
+@Singleton
 class ChangeEventListener implements EventListener {
   private static final Logger log = LoggerFactory
       .getLogger(ChangeEventListener.class);
@@ -78,7 +80,6 @@ class ChangeEventListener implements EventListener {
   private final ReviewersConfig.Factory configFactory;
   private final Provider<CurrentUser> user;
   private final ChangeQueryBuilder queryBuilder;
-  private ReviewDb db;
 
   @Inject
   ChangeEventListener(
@@ -118,7 +119,8 @@ class ChangeEventListener implements EventListener {
       return;
     }
     PatchSetCreatedEvent e = (PatchSetCreatedEvent) event;
-    Project.NameKey projectName = new Project.NameKey(e.change.project);
+    ChangeAttribute c = e.change.get();
+    Project.NameKey projectName = new Project.NameKey(c.project);
     // TODO(davido): we have to cache per project configuration
     ReviewersConfig config = configFactory.create(projectName);
     List<ReviewerFilterSection> sections = config.getReviewerFilterSections();
@@ -130,31 +132,21 @@ class ChangeEventListener implements EventListener {
     try (Repository git = repoManager.openRepository(projectName);
         RevWalk rw = new RevWalk(git);
         ReviewDb reviewDb = schemaFactory.open()) {
-      Change.Id changeId = new Change.Id(Integer.parseInt(e.change.number));
-      PatchSet.Id psId =
-          new PatchSet.Id(changeId, Integer.parseInt(e.patchSet.number));
-      PatchSet ps = reviewDb.patchSets().get(psId);
-      if (ps == null) {
-        log.warn("Patch set " + psId.get() + " not found.");
-        return;
-      }
-
-      final Change change = reviewDb.changes().get(psId.getParentKey());
-      if (change == null) {
-        log.warn("Change " + changeId.get() + " not found.");
-        return;
-      }
-
-      Set<String> reviewers = findReviewers(sections, reviewDb, change);
+      ChangeData changeData = changeDataFactory.create(
+          reviewDb, projectName, new Change.Id(Integer.parseInt(c.number)));
+      Set<String> reviewers = findReviewers(sections, changeData);
       if (reviewers.isEmpty()) {
         return;
       }
 
-      final Runnable task =
-          reviewersFactory.create(change,
-              toAccounts(reviewers, projectName, e.uploader.email));
+      final Change change = changeData.change();
+      final Runnable task = reviewersFactory.create(change,
+          toAccounts(reviewDb, reviewers, projectName,
+              e.uploader.get().email));
 
       workQueue.getDefaultQueue().submit(new Runnable() {
+        ReviewDb db = null;
+
         @Override
         public void run() {
           RequestContext old = tl.setContext(new RequestContext() {
@@ -197,11 +189,11 @@ class ChangeEventListener implements EventListener {
     }
   }
 
-  private Set<String> findReviewers(
-      List<ReviewerFilterSection> sections, final ReviewDb reviewDb,
-      final Change change) throws OrmException, QueryParseException {
+  private Set<String> findReviewers(List<ReviewerFilterSection> sections,
+      ChangeData changeData) throws OrmException, QueryParseException {
     ImmutableSet.Builder<String> reviewers = ImmutableSet.builder();
-    List<ReviewerFilterSection> found = findReviewerSections(sections, reviewDb, change);
+    List<ReviewerFilterSection> found = findReviewerSections(sections,
+        changeData);
     for (ReviewerFilterSection s : found) {
       reviewers.addAll(s.getReviewers());
     }
@@ -209,10 +201,9 @@ class ChangeEventListener implements EventListener {
   }
 
   private List<ReviewerFilterSection> findReviewerSections(
-      List<ReviewerFilterSection> sections, final ReviewDb reviewDb,
-      final Change change) throws OrmException, QueryParseException {
+      List<ReviewerFilterSection> sections, ChangeData changeData)
+          throws OrmException, QueryParseException {
     ImmutableList.Builder<ReviewerFilterSection> found = ImmutableList.builder();
-    ChangeData changeData = changeDataFactory.create(reviewDb, change);
     for (ReviewerFilterSection s : sections) {
       if (Strings.isNullOrEmpty(s.getFilter())
           || s.getFilter().equals("*")) {
@@ -232,16 +223,16 @@ class ChangeEventListener implements EventListener {
     // TODO(davido): check that the potential review can see this change
     // by adding AND is_visible() predicate? Or is it OK to assume
     // that reviewers always can see it?
-    return filterPredicate.match(changeData);
+    return filterPredicate.asMatchable().match(changeData);
   }
 
-  private Set<Account> toAccounts(Set<String> in, Project.NameKey p,
-      String uploaderEMail) {
+  private Set<Account> toAccounts(ReviewDb reviewDb, Set<String> in,
+      Project.NameKey p, String uploaderEMail) {
     Set<Account> reviewers = Sets.newHashSetWithExpectedSize(in.size());
     GroupMembers groupMembers = null;
     for (String r : in) {
       try {
-        Account account = accountResolver.find(r);
+        Account account = accountResolver.find(reviewDb, r);
         if (account != null) {
           reviewers.add(account);
           continue;
